@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Conservative SALT extractor for the 22 prespecified play participants.
+
+Run on an approved lab computer. Reads source .slt files without modifications.
+Outputs contain participant utterances; keep inside approved lab storage.
+Not a SALT normative parser: child CSU rates use raw C-lines as denominator.
+"""
+import argparse, csv, hashlib, re, json
+from pathlib import Path
+from collections import Counter
+
+IDS = '''6003 6007 6008 6010 6012 6013 6016 6017 6019 6022 6023 6028 6032 6034 6042 6043 6044 6029 6045 6011 6015 6033'''.split()
+SPEAKER = re.compile(r'^\s*([PCSE])\s+(.+?)\s*$')
+CSU = re.compile(r'(?<![A-Za-z])CSU(?::(SE|ES))?(?![A-Za-z])', re.I)
+
+
+def load_text(path):
+    blob=path.read_bytes()
+    for enc in ('utf-8-sig','cp1252'):
+        try: return blob.decode(enc), enc, hashlib.sha256(blob).hexdigest()
+        except UnicodeError: pass
+    raise ValueError('Could not decode as UTF-8 or CP1252')
+
+
+def write_rows(path, headers, rows):
+    with path.open('w', newline='', encoding='utf-8-sig') as f:
+        w=csv.DictWriter(f, fieldnames=headers);w.writeheader();w.writerows(rows)
+
+
+def run(root, out):
+    if not root.is_dir(): raise SystemExit(f'No transcript folder: {root}')
+    if root.resolve()==out.resolve(): raise SystemExit('Output must be separate from source')
+    out.mkdir(parents=True,exist_ok=True)
+    files={}
+    for p in root.rglob('*'):
+        if p.is_file() and p.suffix.casefold()=='.slt':
+            m=re.match(r'^(\d{4})(?=\D|$)',p.name)
+            if m and m.group(1) in IDS:files.setdefault(m.group(1),[]).append(p)
+    parent_rows=[]; stats=[]; warnings=[]; manifest=[]
+    for pid in IDS:
+        paths=files.get(pid,[])
+        if len(paths)!=1:
+            warnings.append({'participant_id':pid,'issue':'missing_file' if not paths else 'duplicate_id','detail':str(len(paths))})
+            continue
+        p=paths[0]
+        try: content, enc, sha=load_text(p)
+        except ValueError as e:
+            warnings.append({'participant_id':pid,'issue':'decode_failed','detail':str(e)})
+            continue
+        counts=Counter();c_csu=0; c_es=0;c_se=0;c_unspec=0
+        for n,line in enumerate(content.splitlines(),1):
+            m=SPEAKER.match(line)
+            if not m: continue
+            speaker, speech=m.group(1),m.group(2)
+            counts[speaker]+=1
+            if speaker=='P':
+                parent_rows.append({'participant_id':pid,'caregiver_utterance':speech,'source_line':n,'source_file':p.name})
+            if speaker=='C':
+                code_matches=list(CSU.finditer(speech))
+                if code_matches:
+                    c_csu+=1
+                    kinds={x.group(1).upper() if x.group(1) else 'UNSPEC' for x in code_matches}
+                    c_es+=int('ES' in kinds);c_se+=int('SE' in kinds);c_unspec+=int('UNSPEC' in kinds)
+                    if len(code_matches)>1 or len(kinds)>1:
+                        warnings.append({'participant_id':pid,'issue':'multiple_CSU_codes_one_child_line','detail':f'line {n}'})
+        n_child=counts['C']
+        stats.append({'participant_id':pid,'parent_lines':counts['P'],'child_lines_raw':n_child,
+            'child_CSU_lines':c_csu,'child_CSU_ES_lines':c_es,'child_CSU_SE_lines':c_se,
+            'child_CSU_unspecified_lines':c_unspec,
+            'child_CSU_pct_RAW_not_final':round(100*c_csu/n_child,4) if n_child else '',
+            'eligible_child_utterances_SALT_verified':'', 'eligible_caregiver_tokens_SALT_verified':''})
+        manifest.append({'participant_id':pid,'relative_source_path':str(p.relative_to(root)),
+            'source_sha256':sha,'encoding':enc})
+        if not counts['P'] or not n_child:
+            warnings.append({'participant_id':pid,'issue':'missing_parent_or_child','detail':f'P={counts["P"]} C={n_child}'})
+    write_rows(out/'caregiver_only.csv', ['participant_id','caregiver_utterance','source_line','source_file'], parent_rows)
+    write_rows(out/'participant_CSU_PRELIMINARY.csv', ['participant_id','parent_lines','child_lines_raw','child_CSU_lines','child_CSU_ES_lines','child_CSU_SE_lines','child_CSU_unspecified_lines','child_CSU_pct_RAW_not_final','eligible_child_utterances_SALT_verified','eligible_caregiver_tokens_SALT_verified'],stats)
+    write_rows(out/'quality_warnings.csv',['participant_id','issue','detail'],warnings)
+    (out/'run_manifest.json').write_text(json.dumps({'scope_ids':IDS,'source_files':manifest,'notes':['Raw child lines are NOT SALT-verified eligible utterance denominators','Parent CSV is NOT cleaned or SALT-tokenized','Confirm code conventions and file status before interpreting']},indent=2),encoding='utf-8')
+    print(f'IDs requested: {len(IDS)} | matched: {len(stats)} | parent lines: {len(parent_rows)} | warnings: {len(warnings)}')
+    print('Output folder:',out)
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--input-dir',type=Path,required=True)
+    ap.add_argument('--output-dir',type=Path,required=True)
+    args=ap.parse_args();run(args.input_dir,args.output_dir)
